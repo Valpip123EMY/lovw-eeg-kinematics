@@ -645,6 +645,9 @@ def evaluate_classification_pipelines(eeg_data, kin_data, labels, n_splits=5):
     4. Latent Kin (Ours)       : EEGNet EEG->predicted latent -> SVM
                                  (Kin-AE retrained inside fold — no leakage)
     \"\"\"
+    from sklearn.linear_model import RidgeCV
+    from sklearn.model_selection import GridSearchCV
+
     n_trials, n_chans, seq_len = eeg_data.shape
     X_eeg_raw  = eeg_data                                # (n, C, T)
     X_eeg_flat = eeg_data.reshape(n_trials, -1)          # (n, C*T)
@@ -690,8 +693,8 @@ def evaluate_classification_pipelines(eeg_data, kin_data, labels, n_splits=5):
         acc_dir_eegnet.append(np.mean(preds == y_te))
 
         # ── 3. Explicit Kinematics — Crell SOTA (Ridge Regression) ─────────
-        # Multi-output Ridge: EEG_flat -> [Vx, Vy, Speed] time series
-        ridge = Ridge(alpha=1.0)
+        # Multi-output RidgeCV: EEG_flat -> [Vx, Vy, Speed] time series (finding optimal alpha)
+        ridge = RidgeCV(alphas=np.logspace(-2, 4, 7))
         ridge.fit(X_flat_tr_sc, X_exp_tr)
         X_exp_pred_tr = ridge.predict(X_flat_tr_sc)
         X_exp_pred_te = ridge.predict(X_flat_te_sc)
@@ -700,7 +703,9 @@ def evaluate_classification_pipelines(eeg_data, kin_data, labels, n_splits=5):
         X_exp_pred_tr_sc = scaler_kin.fit_transform(X_exp_pred_tr)
         X_exp_pred_te_sc = scaler_kin.transform(X_exp_pred_te)
 
-        svm_exp = SVC(kernel='rbf', C=5.0, gamma='scale')
+        # RBF SVM with hyperparameter grid search inside fold
+        param_grid = {'C': [0.1, 1, 5, 10, 50], 'gamma': ['scale', 'auto', 0.01, 0.1]}
+        svm_exp = GridSearchCV(SVC(kernel='rbf'), param_grid, cv=3, n_jobs=1)
         svm_exp.fit(X_exp_pred_tr_sc, y_tr)
         acc_explicit.append(svm_exp.score(X_exp_pred_te_sc, y_te))
 
@@ -726,12 +731,12 @@ def evaluate_classification_pipelines(eeg_data, kin_data, labels, n_splits=5):
             lat_pred_tr = net_reg(Xtr_t).cpu().numpy()
             lat_pred_te = net_reg(Xte_t).cpu().numpy()
 
-        # SVM on predicted latent representations
+        # SVM with hyperparameter grid search inside fold
         scaler_lat_pred = StandardScaler()
         lat_pred_tr_sc = scaler_lat_pred.fit_transform(lat_pred_tr)
         lat_pred_te_sc = scaler_lat_pred.transform(lat_pred_te)
 
-        svm_lat = SVC(kernel='rbf', C=5.0, gamma='scale')
+        svm_lat = GridSearchCV(SVC(kernel='rbf'), param_grid, cv=3, n_jobs=1)
         svm_lat.fit(lat_pred_tr_sc, y_tr)
         acc_latent.append(svm_lat.score(lat_pred_te_sc, y_te))
 
