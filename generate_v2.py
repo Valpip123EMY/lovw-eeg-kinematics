@@ -513,21 +513,31 @@ def compute_rdm_correlation_distance(data_flat):
     return squareform(dists)
 
 
-def align_manifolds_cca(eeg_embeddings, kin_latents, n_components=3):
-    \"\"\"CCA alignment between EEG latent space and kinematic manifold.\"\"\"
+def align_manifolds_cca(eeg_embeddings, kin_latents, n_components=3, n_splits=5):
+    \"\"\"Cross-validated CCA alignment to prevent overfitting.\"\"\"
     if len(kin_latents.shape) == 3:
         kin_flat = kin_latents.reshape(len(kin_latents), -1)
     else:
         kin_flat = kin_latents
 
-    cca = CCA(n_components=n_components)
-    eeg_c, kin_c = cca.fit_transform(eeg_embeddings, kin_flat)
+    from sklearn.model_selection import KFold
+    kf = KFold(n_splits=n_splits, shuffle=True, random_state=42)
+    
+    test_eeg_c = np.zeros((len(eeg_embeddings), n_components))
+    test_kin_c = np.zeros((len(kin_latents), n_components))
+    
+    for train_idx, test_idx in kf.split(eeg_embeddings):
+        cca = CCA(n_components=n_components)
+        cca.fit(eeg_embeddings[train_idx], kin_flat[train_idx])
+        eeg_te_c, kin_te_c = cca.transform(eeg_embeddings[test_idx], kin_flat[test_idx])
+        test_eeg_c[test_idx] = eeg_te_c
+        test_kin_c[test_idx] = kin_te_c
 
     corrs = []
     for i in range(n_components):
-        r, _ = pearsonr(eeg_c[:, i], kin_c[:, i])
+        r, _ = pearsonr(test_eeg_c[:, i], test_kin_c[:, i])
         corrs.append(r)
-    return corrs, eeg_c, kin_c
+    return corrs, test_eeg_c, test_kin_c
 
 
 def compute_time_resolved_rsa(eeg_data, speeds, phases, shapes, window_len=20, step_len=5):
@@ -560,32 +570,49 @@ def compute_time_resolved_rsa(eeg_data, speeds, phases, shapes, window_len=20, s
     return np.array(time_points), np.array(rsa_speed), np.array(rsa_phase), np.array(rsa_shape)
 
 
-def decode_signal(X, y, alpha=100.0, shuffle=False):
-    n_trials = len(X)
-    split = int(0.8 * n_trials)
-    X_train, X_test = X[:split], X[split:]
-    y_train, y_test = y[:split], y[split:]
-
-    if shuffle:
-        np.random.seed(42)
-        y_train = y_train[np.random.permutation(len(y_train))]
-
-    scaler = StandardScaler()
-    X_train_sc = scaler.fit_transform(X_train)
-    X_test_sc = scaler.transform(X_test)
-
-    ridge = Ridge(alpha=alpha)
-    ridge.fit(X_train_sc, y_train)
-    y_pred = ridge.predict(X_test_sc)
-
-    corrs = []
-    for i in range(len(y_test)):
-        r, _ = pearsonr(y_test[i], y_pred[i])
-        if not np.isnan(r):
-            corrs.append(r)
-
-    cross_trial_r, _ = pearsonr(y_test.mean(axis=1), y_pred.mean(axis=1))
-    return np.mean(corrs), cross_trial_r, y_test, y_pred
+def decode_signal(X, y, alpha=100.0, shuffle=False, n_splits=5):
+    \"\"\"
+    Decodes handwriting speed from EEG using K-Fold cross-validation.
+    Returns mean within-trial r, mean cross-trial r, and sample test predictions.
+    \"\"\"
+    from sklearn.model_selection import KFold
+    kf = KFold(n_splits=n_splits, shuffle=True, random_state=42)
+    
+    fold_within_rs = []
+    fold_cross_rs = []
+    sample_y_test = None
+    sample_y_pred = None
+    
+    for train_idx, test_idx in kf.split(X):
+        X_train, X_test = X[train_idx], X[test_idx]
+        y_train, y_test = y[train_idx], y[test_idx]
+        
+        if shuffle:
+            np.random.seed(42)
+            y_train = y_train[np.random.permutation(len(y_train))]
+            
+        scaler = StandardScaler()
+        X_train_sc = scaler.fit_transform(X_train)
+        X_test_sc = scaler.transform(X_test)
+        
+        ridge = Ridge(alpha=alpha)
+        ridge.fit(X_train_sc, y_train)
+        y_pred = ridge.predict(X_test_sc)
+        
+        corrs = []
+        for i in range(len(y_test)):
+            r, _ = pearsonr(y_test[i], y_pred[i])
+            if not np.isnan(r):
+                corrs.append(r)
+        fold_within_rs.append(np.mean(corrs))
+        
+        cross_r, _ = pearsonr(y_test.mean(axis=1), y_pred.mean(axis=1))
+        fold_cross_rs.append(cross_r)
+        
+        sample_y_test = y_test
+        sample_y_pred = y_pred
+        
+    return np.mean(fold_within_rs), np.mean(fold_cross_rs), sample_y_test, sample_y_pred
 
 
 # --- Run for S1 (P4) ---
