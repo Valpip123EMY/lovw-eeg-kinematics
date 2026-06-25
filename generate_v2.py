@@ -645,13 +645,75 @@ print(f"EEG-AE Embeds -> Within-Trial r: {emb_r:.4f} | Cross-Trial r: {emb_cross
 """
 
 CELL_CLASSIFICATION = """\
+def extract_9_kinematic_features(kin_data, sfreq=100.0):
+    \"\"\"
+    Extracts 9 explicit kinematic features from velocity trajectories:
+    1. Position X (integrated Vx)
+    2. Position Y (integrated Vy)
+    3. Velocity X (Vx)
+    4. Velocity Y (Vy)
+    5. Acceleration X (derivative of Vx)
+    6. Acceleration Y (derivative of Vy)
+    7. Speed (sqrt(Vx^2 + Vy^2))
+    8. Curvature ((Vx*Ay - Vy*Ax) / (Speed^3 + 1e-5))
+    9. Angle (arctan2(Vy, Vx))
+    \"\"\"
+    n_trials, _, n_times = kin_data.shape
+    features_list = []
+    dt = 1.0 / sfreq
+    for i in range(n_trials):
+        vx = kin_data[i, 0, :]
+        vy = kin_data[i, 1, :]
+        
+        # 1-2. Position
+        x = np.cumsum(vx) * dt
+        y = np.cumsum(vy) * dt
+        
+        # 3-4. Velocity (raw vx, vy already)
+        
+        # 5-6. Acceleration
+        ax = np.gradient(vx, dt)
+        ay = np.gradient(vy, dt)
+        
+        # 7. Speed
+        speed = np.sqrt(vx**2 + vy**2)
+        
+        # 8. Curvature
+        speed_eps = speed.copy()
+        speed_eps[speed_eps < 1e-4] = 1e-4
+        curvature = (vx * ay - vy * ax) / (speed_eps**3)
+        curvature = np.clip(curvature, -10, 10)
+        
+        # 9. Angle
+        angle = np.arctan2(vy, vx)
+        
+        trial_feats = np.stack([x, y, vx, vy, ax, ay, speed, curvature, angle], axis=0)
+        features_list.append(trial_feats)
+    return np.array(features_list)
+
+
+def extract_slda_features(eeg_data):
+    \"\"\"
+    Downsamples/bins EEG temporal trajectory by averaging every 10 samples.
+    Reduces feature dimensionality from 31 x 151 (4681) to 31 x 15 (465) to capture
+    MRCP (Movement-Related Cortical Potential) dynamics without high-frequency noise.
+    \"\"\"
+    n_trials, n_chans, n_times = eeg_data.shape
+    bin_size = 10
+    n_bins = n_times // bin_size
+    eeg_binned = np.zeros((n_trials, n_chans, n_bins))
+    for b in range(n_bins):
+        eeg_binned[:, :, b] = eeg_data[:, :, b*bin_size:(b+1)*bin_size].mean(axis=2)
+    return eeg_binned.reshape(n_trials, -1)
+
+
 def evaluate_classification_pipelines(eeg_data, kin_data, labels, n_splits=5):
     \"\"\"
-    Fixed v2 benchmark — four classification pipelines:
-    1. Direct EEG (sLDA)       : flattened EEG -> shrinkage LDA
+    SOTA BCI benchmark — four classification pipelines:
+    1. Direct EEG (sLDA)       : binned EEG (MRCP features) -> shrinkage LDA
     2. Direct EEG (EEGNet)     : raw EEG -> EEGNet end-to-end classifier
-    3. Explicit Kin (Crell)    : Ridge Regression EEG->kinematics -> SVM  [faithful Crell]
-    4. Latent Kin (Ours)       : EEGNet EEG->predicted latent -> SVM
+    3. Explicit Kin (Crell)    : Ridge Regression EEG -> 9 explicit kinematics -> SVM [Crell baseline]
+    4. Latent Kin (Ours)       : EEGNet EEG -> predicted AE latent -> SVM
                                  (Kin-AE retrained inside fold — no leakage)
     \"\"\"
     from sklearn.linear_model import RidgeCV
@@ -661,11 +723,9 @@ def evaluate_classification_pipelines(eeg_data, kin_data, labels, n_splits=5):
     X_eeg_raw  = eeg_data                                # (n, C, T)
     X_eeg_flat = eeg_data.reshape(n_trials, -1)          # (n, C*T)
 
-    # Explicit kinematics target: Vx, Vy, Speed  (3 x T each)
-    vx    = kin_data[:, 0, :]
-    vy    = kin_data[:, 1, :]
-    speed = np.sqrt(vx**2 + vy**2)
-    X_explicit = np.concatenate([vx, vy, speed], axis=1)  # (n, 3T)
+    # Pre-extract the 9 explicit features for all trials: shape (n_trials, 9 * seq_len)
+    X_explicit_all = extract_9_kinematic_features(kin_data)
+    X_explicit = X_explicit_all.reshape(n_trials, -1)
 
     n_classes = len(np.unique(labels))
     skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
@@ -682,15 +742,22 @@ def evaluate_classification_pipelines(eeg_data, kin_data, labels, n_splits=5):
         kin_tr,    kin_te    = kin_data[train_idx],     kin_data[test_idx]
         y_tr,      y_te      = labels[train_idx],       labels[test_idx]
 
-        # Standardize EEG features (for sLDA + Ridge)
+        # Standardize raw flat EEG for RidgeCV
         scaler_eeg = StandardScaler()
         X_flat_tr_sc = scaler_eeg.fit_transform(X_flat_tr)
         X_flat_te_sc = scaler_eeg.transform(X_flat_te)
 
-        # ── 1. Direct EEG (sLDA) ────────────────────────────────────────────
+        # ── 1. Direct EEG (sLDA on MRCP features) ────────────────────────────
+        X_slda_tr = extract_slda_features(X_raw_tr)
+        X_slda_te = extract_slda_features(X_raw_te)
+        
+        scaler_slda = StandardScaler()
+        X_slda_tr_sc = scaler_slda.fit_transform(X_slda_tr)
+        X_slda_te_sc = scaler_slda.transform(X_slda_te)
+
         clf_slda = LinearDiscriminantAnalysis(solver='lsqr', shrinkage='auto')
-        clf_slda.fit(X_flat_tr_sc, y_tr)
-        acc_dir_slda.append(clf_slda.score(X_flat_te_sc, y_te))
+        clf_slda.fit(X_slda_tr_sc, y_tr)
+        acc_dir_slda.append(clf_slda.score(X_slda_te_sc, y_te))
 
         # ── 2. Direct EEG (EEGNet Classifier) ──────────────────────────────
         net_clf = train_eegnet(X_raw_tr, y_tr, output_dim=n_classes, mode='classifier',
@@ -701,8 +768,8 @@ def evaluate_classification_pipelines(eeg_data, kin_data, labels, n_splits=5):
             preds = torch.argmax(net_clf(Xte_t), dim=1).cpu().numpy()
         acc_dir_eegnet.append(np.mean(preds == y_te))
 
-        # ── 3. Explicit Kinematics — Crell SOTA (Ridge Regression) ─────────
-        # Multi-output RidgeCV: EEG_flat -> [Vx, Vy, Speed] time series (finding optimal alpha)
+        # ── 3. Explicit Kinematics — Crell Baseline (Ridge Regression) ─────
+        # Multi-output RidgeCV: EEG_flat -> 9 explicit features (finding optimal alpha)
         ridge = RidgeCV(alphas=np.logspace(-2, 4, 7))
         ridge.fit(X_flat_tr_sc, X_exp_tr)
         X_exp_pred_tr = ridge.predict(X_flat_tr_sc)
@@ -712,7 +779,7 @@ def evaluate_classification_pipelines(eeg_data, kin_data, labels, n_splits=5):
         X_exp_pred_tr_sc = scaler_kin.fit_transform(X_exp_pred_tr)
         X_exp_pred_te_sc = scaler_kin.transform(X_exp_pred_te)
 
-        # Denoise Crell predicted kinematics using PCA (from 453 to 10 components)
+        # Denoise Crell predicted kinematics using PCA (from 9 * 151 to 10 components)
         pca_crell = PCA(n_components=10)
         X_exp_pred_tr_pca = pca_crell.fit_transform(X_exp_pred_tr_sc)
         X_exp_pred_te_pca = pca_crell.transform(X_exp_pred_te_sc)
