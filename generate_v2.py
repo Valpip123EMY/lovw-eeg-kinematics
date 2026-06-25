@@ -274,21 +274,25 @@ class EEGNet(nn.Module):
         super().__init__()
         self.mode = mode
 
-        self.temporal_conv = nn.Conv2d(1, 8, kernel_size=(1, 64), padding=(0, 32), bias=False)
-        self.bn1 = nn.BatchNorm2d(8)
+        F1 = 16 if mode == 'regressor' else 8
+        D = 2
+        F2 = F1 * D
 
-        self.spatial_conv = nn.Conv2d(8, 16, kernel_size=(n_chans, 1), groups=8, bias=False)
-        self.bn2 = nn.BatchNorm2d(16)
+        self.temporal_conv = nn.Conv2d(1, F1, kernel_size=(1, 64), padding=(0, 32), bias=False)
+        self.bn1 = nn.BatchNorm2d(F1)
+
+        self.spatial_conv = nn.Conv2d(F1, F2, kernel_size=(n_chans, 1), groups=F1, bias=False)
+        self.bn2 = nn.BatchNorm2d(F2)
         self.elu = nn.ELU()
         self.pool1 = nn.AvgPool2d((1, 4))
         self.dropout1 = nn.Dropout(0.25)
 
-        self.separable_conv = nn.Conv2d(16, 16, kernel_size=(1, 16), padding=(0, 8), groups=16, bias=False)
-        self.bn3 = nn.BatchNorm2d(16)
+        self.separable_conv = nn.Conv2d(F2, F2, kernel_size=(1, 16), padding=(0, 8), groups=F2, bias=False)
+        self.bn3 = nn.BatchNorm2d(F2)
         self.pool2 = nn.AvgPool2d((1, 8))
         self.dropout2 = nn.Dropout(0.25)
 
-        self.flat_features = 16 * 4  # 64
+        self.flat_features = F2 * 4  # 64 for classifier, 128 for regressor
         self.fc = nn.Linear(self.flat_features, output_dim)
 
     def forward(self, x):
