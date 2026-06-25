@@ -516,7 +516,12 @@ def compute_rdm_correlation_distance(data_flat):
 def align_manifolds_cca(eeg_embeddings, kin_latents, n_components=3, n_splits=5):
     \"\"\"Cross-validated CCA alignment to prevent overfitting.\"\"\"
     if len(kin_latents.shape) == 3:
-        kin_flat = kin_latents.reshape(len(kin_latents), -1)
+        n_trials = len(kin_latents)
+        kin_flat = kin_latents.reshape(n_trials, -1)
+        scaler = StandardScaler()
+        kin_flat_sc = scaler.fit_transform(kin_flat)
+        pca_cca = PCA(n_components=6)
+        kin_flat = pca_cca.fit_transform(kin_flat_sc)
     else:
         kin_flat = kin_latents
 
@@ -524,7 +529,7 @@ def align_manifolds_cca(eeg_embeddings, kin_latents, n_components=3, n_splits=5)
     kf = KFold(n_splits=n_splits, shuffle=True, random_state=42)
     
     test_eeg_c = np.zeros((len(eeg_embeddings), n_components))
-    test_kin_c = np.zeros((len(kin_latents), n_components))
+    test_kin_c = np.zeros((len(kin_flat), n_components))
     
     for train_idx, test_idx in kf.split(eeg_embeddings):
         cca = CCA(n_components=n_components)
@@ -703,11 +708,16 @@ def evaluate_classification_pipelines(eeg_data, kin_data, labels, n_splits=5):
         X_exp_pred_tr_sc = scaler_kin.fit_transform(X_exp_pred_tr)
         X_exp_pred_te_sc = scaler_kin.transform(X_exp_pred_te)
 
+        # Denoise Crell predicted kinematics using PCA (from 453 to 10 components)
+        pca_crell = PCA(n_components=10)
+        X_exp_pred_tr_pca = pca_crell.fit_transform(X_exp_pred_tr_sc)
+        X_exp_pred_te_pca = pca_crell.transform(X_exp_pred_te_sc)
+
         # RBF SVM with hyperparameter grid search inside fold
         param_grid = {'C': [0.1, 1, 5, 10, 50], 'gamma': ['scale', 'auto', 0.01, 0.1]}
         svm_exp = GridSearchCV(SVC(kernel='rbf'), param_grid, cv=3, n_jobs=1)
-        svm_exp.fit(X_exp_pred_tr_sc, y_tr)
-        acc_explicit.append(svm_exp.score(X_exp_pred_te_sc, y_te))
+        svm_exp.fit(X_exp_pred_tr_pca, y_tr)
+        acc_explicit.append(svm_exp.score(X_exp_pred_te_pca, y_te))
 
         # ── 4. Latent Kinematics — Ours SOTA (EEGNet + leak-free AE) ───────
         # Retrain kinematic AE on training fold only
@@ -720,9 +730,9 @@ def evaluate_classification_pipelines(eeg_data, kin_data, labels, n_splits=5):
         lat_tr_sc = scaler_lat_tgt.fit_transform(lat_tr)
         lat_te_sc = scaler_lat_tgt.transform(lat_te)  # only used as regression target ref
 
-        # Train EEGNet to predict latent from EEG
+        # Train EEGNet to predict latent from EEG (epochs increased for better convergence)
         net_reg = train_eegnet(X_raw_tr, lat_tr_sc, output_dim=lat_tr_sc.shape[1],
-                               mode='regressor', epochs=40,
+                               mode='regressor', epochs=65,
                                desc=f'Fold{fold_idx+1} EEGNet-Reg')
         net_reg.eval()
         with torch.no_grad():
@@ -736,9 +746,14 @@ def evaluate_classification_pipelines(eeg_data, kin_data, labels, n_splits=5):
         lat_pred_tr_sc = scaler_lat_pred.fit_transform(lat_pred_tr)
         lat_pred_te_sc = scaler_lat_pred.transform(lat_pred_te)
 
+        # Denoise predicted latents using PCA (filters out regression reconstruction noise)
+        pca_ours = PCA(n_components=10)
+        lat_pred_tr_pca = pca_ours.fit_transform(lat_pred_tr_sc)
+        lat_pred_te_pca = pca_ours.transform(lat_pred_te_sc)
+
         svm_lat = GridSearchCV(SVC(kernel='rbf'), param_grid, cv=3, n_jobs=1)
-        svm_lat.fit(lat_pred_tr_sc, y_tr)
-        acc_latent.append(svm_lat.score(lat_pred_te_sc, y_te))
+        svm_lat.fit(lat_pred_tr_pca, y_tr)
+        acc_latent.append(svm_lat.score(lat_pred_te_pca, y_te))
 
         fold_bar.set_postfix({
             'sLDA': f'{acc_dir_slda[-1]:.3f}',
